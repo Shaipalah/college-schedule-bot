@@ -13,6 +13,8 @@ import pandas as pd
 import pdfplumber
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 PAGE_URL = "https://rgkript.ru/raspisanie-zanyatiy/"
 DEFAULT_GROUP = "ТЭТ-22"
@@ -66,8 +68,29 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     )
 
 
+def create_http_session() -> requests.Session:
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+HTTP_SESSION = create_http_session()
+
+
 def fetch_bytes(url: str) -> bytes:
-    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=45)
+    resp = HTTP_SESSION.get(url, timeout=(20, 45))
     resp.raise_for_status()
     return resp.content
 
@@ -88,7 +111,12 @@ def parse_schedule_page(html_text: str) -> tuple[dict[str, str] | None, list[dic
 
     if xls_links:
         first_href = urljoin(PAGE_URL, xls_links[0]["href"].strip())
-        heading_tag = content.find("h3", string=re.compile(r"Расписание", re.IGNORECASE))
+        heading_tag = None
+        for h3 in content.find_all("h3"):
+            h3_text = h3.get_text(" ", strip=True).lower()
+            if "расписание учебных занятий" in h3_text:
+                heading_tag = h3
+                break
         if not heading_tag:
             for h3 in content.find_all("h3"):
                 if "расписание" in h3.get_text(" ", strip=True).lower():
@@ -312,7 +340,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         chunks.append(remaining)
 
     for chunk in chunks:
-        resp = requests.post(
+        resp = HTTP_SESSION.post(
             url,
             data={
                 "chat_id": chat_id,
@@ -336,7 +364,7 @@ def send_telegram_document(
     data: dict[str, Any] = {"chat_id": chat_id}
     if caption:
         data["caption"] = caption[:1024]
-    resp = requests.post(
+    resp = HTTP_SESSION.post(
         url,
         data=data,
         files={"document": (filename, file_bytes, "application/pdf")},
@@ -359,8 +387,16 @@ def main() -> int:
     sent_anything = False
 
     print(f"Fetching {PAGE_URL} for group '{group_name}'...")
-    page_resp = requests.get(PAGE_URL, headers=REQUEST_HEADERS, timeout=30)
-    page_resp.raise_for_status()
+    try:
+        page_resp = HTTP_SESSION.get(PAGE_URL, timeout=(20, 45))
+        page_resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        print(
+            f"Warning: could not reach {PAGE_URL} ({exc}). Skipping this check.",
+            file=sys.stderr,
+        )
+        return 0
+
     if not page_resp.encoding or page_resp.encoding.lower() == "iso-8859-1":
         page_resp.encoding = page_resp.apparent_encoding or "utf-8"
 
@@ -371,35 +407,46 @@ def main() -> int:
     # 1. Check general .xls schedule
     if xls_info:
         xls_url = xls_info["url"]
-        xls_bytes = fetch_bytes(xls_url)
-        xls_hash = sha256_bytes(xls_bytes)
-        prev_xls = state.get("xls") or {}
+        try:
+            xls_bytes = fetch_bytes(xls_url)
+        except requests.exceptions.RequestException as exc:
+            print(f"Warning: failed to download XLS {xls_url} ({exc}).", file=sys.stderr)
+            xls_bytes = None
 
-        if prev_xls.get("url") != xls_url or prev_xls.get("sha256") != xls_hash:
-            print(f"XLS changed or new: {xls_url} (sha256={xls_hash[:12]}...)")
-            schedule_msg = parse_xls_for_group(xls_bytes, group_name)
-            if schedule_msg:
-                send_telegram_message(token, chat_id, schedule_msg)
-                sent_anything = True
-                print(f"Sent XLS schedule for group '{group_name}'.")
+        if xls_bytes is not None:
+            xls_hash = sha256_bytes(xls_bytes)
+            prev_xls = state.get("xls") or {}
+
+            if prev_xls.get("url") != xls_url or prev_xls.get("sha256") != xls_hash:
+                print(f"XLS changed or new: {xls_url} (sha256={xls_hash[:12]}...)")
+                schedule_msg = parse_xls_for_group(xls_bytes, group_name)
+                if schedule_msg:
+                    send_telegram_message(token, chat_id, schedule_msg)
+                    sent_anything = True
+                    print(f"Sent XLS schedule for group '{group_name}'.")
+                else:
+                    print(f"Group '{group_name}' not found in sheet 'Учебные группы'.")
+
+                state["xls"] = {
+                    "url": xls_url,
+                    "sha256": xls_hash,
+                    "title": xls_info["title"],
+                }
+                state_changed = True
             else:
-                print(f"Group '{group_name}' not found in sheet 'Учебные группы'.")
-
-            state["xls"] = {
-                "url": xls_url,
-                "sha256": xls_hash,
-                "title": xls_info["title"],
-            }
-            state_changed = True
-        else:
-            print("XLS schedule is unchanged.")
+                print("XLS schedule is unchanged.")
 
     # 2. Check replacement .pdf files
     pdfs_state: dict[str, Any] = state.setdefault("pdfs", {})
     for pdf_item in pdf_links:
         pdf_url = pdf_item["url"]
         pdf_title = pdf_item["title"]
-        pdf_bytes = fetch_bytes(pdf_url)
+        try:
+            pdf_bytes = fetch_bytes(pdf_url)
+        except requests.exceptions.RequestException as exc:
+            print(f"Warning: failed to download PDF {pdf_url} ({exc}).", file=sys.stderr)
+            continue
+
         pdf_hash = sha256_bytes(pdf_bytes)
 
         prev_pdf = pdfs_state.get(pdf_url) or {}
