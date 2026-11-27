@@ -1,1 +1,13 @@
-{}
+{
+  "xls": {
+    "url": "https://rgkript.ru/wp-content/uploads//2026/11/24.11.2026_crd_na-sajt.xls",
+    "sha256": "7a5e341024e0868a411eb9ce436a1a30a13f0739e34e01b6b8902300419e0aee",
+    "title": "Расписание звонков"
+  },
+  "pdfs": {
+    "https://rgkript.ru/wp-content/uploads//2026/11/ZAMENY-28.11.26-g..pdf": {
+      "sha256": "ca55c51a8fdc5f63dae0c8536e5b7f038b108fd6ab5784dd9807c5cc0770e6a1",
+      "title": "ЗАМЕНЫ на 28.11.2026 г."
+    }
+  }
+}
